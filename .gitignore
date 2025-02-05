@@ -1,0 +1,55 @@
+# Kompilowane pliki Pythona i cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Wirtualne środowiska
+env/
+venv/
+ENV/
+.venv/
+
+# Pliki build i dystrybucji
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Logi instalatora i tymczasowe pliki
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Raporty testów i pokrycia kodu
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.pytest_cache/
+
+# Dokumentacja (Sphinx)
+docs/_build/
+
+# PyInstaller
+*.spec
+
+# Konfiguracja IDE i edytorów
+.idea/
+.vscode/
+
+# Cache narzędzi do statycznej analizy
+.mypy_cache/
+.dmypy.json
+.pyre/
+
+# Pliki logów
+*.log
+
+# Inne pliki tymczasowe
+*.tmp
