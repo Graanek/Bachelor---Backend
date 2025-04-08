@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import yfinance as yf
+from tradingview_ta import TA_Handler, Interval
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -142,63 +143,65 @@ async def price_data(
     asset: str = Query(..., description="Symbol aktywa, np. BTC, ETH"),
     timeframe: str = Query(..., description="Przedział czasowy: 1d, 1w, 1m, all")
 ):
-    ticker = map_ticker(asset.upper())
-    
-    # Ustalanie okresu (period) oraz interwału (interval) w zależności od wybranego timeframe
-    if timeframe == "1d":
-        period = "1d"
-        interval = "1m"
-    elif timeframe == "1w":
-        period = "5d"  # Pobieramy ostatnie 5 dni
-        interval = "60m"
-    elif timeframe == "1m":
-        period = "1mo"
-        interval = "1d"
-    elif timeframe == "all":
-        period = "max"
-        interval = "1d"
-    else:
-        raise HTTPException(status_code=400, detail="Niepoprawny przedział czasowy.")
-    
     try:
-        data = yf.download(ticker, period=period, interval=interval)
-        if data.empty:
-            raise HTTPException(status_code=404, detail="Brak danych dla wybranego aktywa i przedziału czasowego.")
-        if "Adj Close" in data.columns:
-            data = data["Adj Close"]
-        elif "Close" in data.columns:
-            data = data["Close"]
-        else:
-            raise HTTPException(status_code=500, detail="Brak kolumny 'Adj Close' lub 'Close' w danych.")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Błąd pobierania danych: {e}")
-    
-    # Reindeksacja – uzupełnienie brakujących interwałów
-    if timeframe == "1d":
-        full_index = pd.date_range(start=data.index[0], end=data.index[-1], freq='T')
-        data = data.reindex(full_index).ffill()
-    elif timeframe == "1w":
-        data = data.resample("4H").last().dropna()
-        full_index = pd.date_range(start=data.index[0], end=data.index[-1], freq='4H')
-        data = data.reindex(full_index).ffill()
-    elif timeframe == "1m":
-        full_index = pd.date_range(start=data.index[0], end=data.index[-1], freq='D')
-        data = data.reindex(full_index).ffill()
-    elif timeframe == "all":
-        full_index = pd.date_range(start=data.index[0], end=data.index[-1], freq='D')
-        data = data.reindex(full_index).ffill()
-    
-    # Format daty – dla danych intraday pokazujemy godzinę i minutę,
-    # w przeciwnym razie tylko datę
-    if timeframe in ["1d", "1w"]:
-        date_format = '%Y-%m-%d %H:%M'
-    else:
-        date_format = '%Y-%m-%d'
+        # Map timeframe to TradingView interval
+        interval_map = {
+            "1d": Interval.INTERVAL_1_MINUTE,
+            "1w": Interval.INTERVAL_1_HOUR,
+            "1m": Interval.INTERVAL_4_HOURS,
+            "all": Interval.INTERVAL_1_DAY
+        }
         
-    dates = data.index.strftime(date_format).tolist()
-    prices = data.values.tolist()
-    
-    return JSONResponse(content={"dates": dates, "prices": prices})
+        interval = interval_map.get(timeframe, Interval.INTERVAL_1_HOUR)
+        
+        # Initialize TradingView handler
+        handler = TA_Handler(
+            symbol=f"{asset}USD",
+            screener="crypto",
+            exchange="BINANCE",
+            interval=interval
+        )
+        
+        # Get analysis from TradingView
+        analysis = handler.get_analysis()
+        
+        # Get current price and indicators
+        current_price = analysis.indicators["close"]
+        
+        # For 24h change calculation
+        open_price = analysis.indicators["open"]
+        high = analysis.indicators["high"]
+        low = analysis.indicators["low"]
+        
+        # Get RSI and MACD values
+        rsi = analysis.indicators['RSI']
+        macd = {
+            'MACD': analysis.indicators['MACD.macd'],
+            'Signal': analysis.indicators['MACD.signal'],
+            'Histogram': analysis.indicators['MACD.hist']
+        }
+        
+        
+        # Calculate 24h change
+        price_change = ((current_price - open_price) / open_price) * 100
+        
+        # Create response data
+        response_data = {
+            "dates": [datetime.datetime.now().strftime('%Y-%m-%d %H:%M')],
+            "prices": [current_price],
+            "price_change_24h": price_change,
+            "high_24h": high,
+            "low_24h": low,
+            "technical_indicators": {
+                "rsi": rsi,
+                "macd": macd
+            }
+        }
+        
+        return JSONResponse(content=response_data)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching price data: {str(e)}")
 
 # Nowy endpoint generujący wykres jako obraz (matplotlib)
 @app.get("/chart")
