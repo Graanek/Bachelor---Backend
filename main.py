@@ -156,7 +156,7 @@ async def price_data(
         
         # Initialize TradingView handler
         handler = TA_Handler(
-            symbol=f"{asset}USD",
+            symbol=f"{asset}USDT",
             screener="crypto",
             exchange="BINANCE",
             interval=interval
