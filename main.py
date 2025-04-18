@@ -495,6 +495,47 @@ def update_database_from_binance(symbol: str, interval: str):
     except Exception as e:
         print(f"Error updating database from Binance: {e}")
 
+def clean_old_data(interval: str):
+    """Clean up old data based on the interval"""
+    conn = sqlite3.connect('crypto_prices.db')
+    cursor = conn.cursor()
+    
+    current_time = datetime.now()
+    
+    # Set the cutoff time based on interval
+    if interval == "5min":
+        cutoff_time = current_time - timedelta(days=1)  # Keep last 24 hours
+    elif interval == "15min":
+        cutoff_time = current_time - timedelta(days=7)  # Keep last 7 days
+    elif interval == "1h":
+        cutoff_time = current_time - timedelta(days=30)  # Keep last 30 days
+    else:  # 1d - keep all historical data
+        return
+    
+    # Convert cutoff time to string format
+    cutoff_time_str = cutoff_time.strftime('%Y-%m-%d %H:%M:%S')
+    
+    # First, count how many records will be deleted
+    cursor.execute(f'''
+        SELECT COUNT(*) FROM crypto_history_{interval}
+        WHERE timestamp < ?
+    ''', (cutoff_time_str,))
+    count = cursor.fetchone()[0]
+    
+    if count > 0:
+        print(f"Cleaning up {count} old records from crypto_history_{interval} table")
+        
+        # Delete old data
+        cursor.execute(f'''
+            DELETE FROM crypto_history_{interval}
+            WHERE timestamp < ?
+        ''', (cutoff_time_str,))
+        
+        conn.commit()
+        print(f"Successfully removed {count} old records from crypto_history_{interval} table")
+    
+    conn.close()
+
 @app.get("/price-data")
 async def price_data(
     asset: str = Query(..., description="Symbol aktywa, np. BTC, ETH"),
@@ -503,10 +544,10 @@ async def price_data(
     try:
         # Map timeframe to interval and limit
         interval_map = {
-            "1d": ("1d", 30),      # Daily data for last 30 days
-            "1w": ("1d", 7),       # Daily data for last week
-            "1m": ("1d", 30),      # Daily data for last month
-            "all": ("1d", None)    # All daily data
+            "1d": ("5min", 288),    # 5min intervals, 288 entries for 24h
+            "1w": ("15min", 672),   # 15min intervals for 1 week
+            "1m": ("1h", 720),      # 1h intervals for 1 month
+            "all": ("1d", None)     # Daily data for all history
         }
         
         if timeframe not in interval_map:
@@ -514,35 +555,140 @@ async def price_data(
             
         interval, limit = interval_map[timeframe]
         
-        # Get data from database
+        # Clean up old data for this interval
+        clean_old_data(interval)
+        
+        # Always try to get data from database first
         history = get_price_history(asset, interval, limit)
+        current_time = datetime.now()
+        
+        # Check if we need to fetch from API
+        should_fetch_from_api = False
         
         if not history:
-            # Try to fetch from Binance if no data in database
+            should_fetch_from_api = True
+        else:
             try:
-                end_time = datetime.now()
-                start_time = end_time - timedelta(days=30)  # Default to last 30 days
-                data = download_binance_data(asset, interval, start_time=start_time, end_time=end_time)
+                latest_timestamp = datetime.strptime(history[0][0], '%Y-%m-%d %H:%M:%S')
+                # Check if data is too old based on interval
+                if interval == "5min" and (current_time - latest_timestamp).total_seconds() > 300:  # 5 minutes
+                    should_fetch_from_api = True
+                elif interval == "15min" and (current_time - latest_timestamp).total_seconds() > 900:  # 15 minutes
+                    should_fetch_from_api = True
+                elif interval == "1h" and (current_time - latest_timestamp).total_seconds() > 3600:  # 1 hour
+                    should_fetch_from_api = True
+                elif interval == "1d" and (current_time - latest_timestamp).total_seconds() > 86400:  # 1 day
+                    should_fetch_from_api = True
+            except (ValueError, IndexError) as e:
+                print(f"Error parsing timestamp: {e}")
+                should_fetch_from_api = True
+        
+        # If we need to fetch from API, update the database
+        if should_fetch_from_api:
+            try:
+                # Set appropriate time range based on interval
+                end_time = current_time
+                if interval == "5min":
+                    start_time = end_time - timedelta(days=1)
+                elif interval == "15min":
+                    start_time = end_time - timedelta(days=7)
+                elif interval == "1h":
+                    start_time = end_time - timedelta(days=30)
+                else:  # 1d - get all historical data
+                    start_time = datetime(2013, 1, 1)
                 
+                # Download and store data
+                data = download_binance_data(asset, interval, start_time=start_time, end_time=end_time)
                 if data:
+                    print(f"Downloaded {len(data)} records for {asset} at {interval} interval")
                     for timestamp, price, volume in data:
                         insert_price_data(asset, price, timestamp, interval, volume)
+                    
+                    # Clean up old data again after inserting new data
+                    clean_old_data(interval)
+                    
+                    # Get updated history from database
                     history = get_price_history(asset, interval, limit)
+                else:
+                    print(f"No new data downloaded for {asset}")
+                    if not history:  # If we have no data at all, raise an error
+                        raise HTTPException(status_code=500, detail="No data available")
             except Exception as e:
                 print(f"Error fetching from Binance: {e}")
+                if not history:  # If we have no data at all, raise an error
+                    raise HTTPException(status_code=500, detail=f"Error fetching price data: {str(e)}")
         
-        if not history:
-            raise HTTPException(status_code=404, detail=f"No data available for {asset}")
+        # Format response data
+        dates = [entry[0] for entry in history]
+        prices = [entry[1] for entry in history]
+        volumes = [entry[2] for entry in history if entry[2] is not None]
         
-        # Format response
+        # For 24h change calculation
+        if prices:
+            open_price = prices[-1]  # Last price in the history
+            current_price = prices[0]  # Latest price
+            price_change = ((current_price - open_price) / open_price) * 100
+            high = max(prices)
+            low = min(prices)
+        else:
+            current_price = 0
+            price_change = 0
+            high = 0
+            low = 0
+        
+        # Get technical indicators from the latest data
+        if prices:
+            # Calculate RSI (simplified version)
+            price_changes = [prices[i] - prices[i+1] for i in range(len(prices)-1)]
+            gains = [change for change in price_changes if change > 0]
+            losses = [-change for change in price_changes if change < 0]
+            
+            avg_gain = sum(gains) / len(gains) if gains else 0
+            avg_loss = sum(losses) / len(losses) if losses else 0
+            
+            if avg_loss == 0:
+                rsi = 100
+            else:
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
+            
+            # Calculate MACD (simplified version)
+            ema12 = sum(prices[:12]) / 12 if len(prices) >= 12 else current_price
+            ema26 = sum(prices[:26]) / 26 if len(prices) >= 26 else current_price
+            macd = ema12 - ema26
+            signal = sum(prices[:9]) / 9 if len(prices) >= 9 else current_price
+            histogram = macd - signal
+            
+            macd_data = {
+                'MACD': macd,
+                'Signal': signal,
+                'Histogram': histogram
+            }
+        else:
+            rsi = 50
+            macd_data = {
+                'MACD': 0,
+                'Signal': 0,
+                'Histogram': 0
+            }
+        
         response_data = {
-            "prices": [{"timestamp": entry[0], "price": entry[1], "volume": entry[2]} for entry in history]
+            "dates": dates,
+            "prices": prices,
+            "volumes": volumes,
+            "price_change_24h": price_change,
+            "high_24h": high,
+            "low_24h": low,
+            "technical_indicators": {
+                "rsi": rsi,
+                "macd": macd_data
+            }
         }
         
         return JSONResponse(content=response_data)
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error fetching price data: {str(e)}")
 
 # Nowy endpoint generujący wykres jako obraz (matplotlib)
 @app.get("/chart")
@@ -606,7 +752,11 @@ def download_all_data():
     
     for symbol in symbols:
         for interval in intervals:
-            print(f"Checking {interval} data for {symbol}...")
+            print(f"\nProcessing {interval} data for {symbol}...")
+            
+            # First, clean up old data for this interval
+            clean_old_data(interval)
+            
             try:
                 # Get the latest timestamp from database
                 history = get_price_history(symbol, interval, limit=1)
@@ -651,6 +801,9 @@ def download_all_data():
                         print(f"Downloaded {len(data)} records for {symbol} at {interval} interval")
                         for timestamp, price, volume in data:
                             insert_price_data(symbol, price, timestamp, interval, volume)
+                        
+                        # Clean up old data again after inserting new data
+                        clean_old_data(interval)
                     else:
                         print(f"No data downloaded for {symbol} at {interval} interval")
                 else:
