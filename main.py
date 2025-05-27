@@ -1,6 +1,8 @@
-# main.py
+import requests
+from fear_and_greed import FearAndGreedIndex
+import csv
 import io
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -9,11 +11,13 @@ import sqlite3
 from tradingview_ta import TA_Handler, Interval
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from io import StringIO
 
+# Initialize Fear & Greed Crypto library
+fg = FearAndGreedIndex()
 app = FastAPI()
 
 # Konfiguracja CORS – pozwalamy na połączenia z dowolnego źródła
@@ -29,8 +33,10 @@ app.add_middleware(
 DEFAULT_ASSETS = ["BTC", "ETH", "XRP", "SOL"]
 
 # Database initialization
+DB = "crypto_prices.db"
+
 def init_db():
-    conn = sqlite3.connect('crypto_prices.db')
+    conn = sqlite3.connect(DB)
     cursor = conn.cursor()
     
     # Create symbols table
@@ -91,13 +97,120 @@ def init_db():
         UNIQUE(symbol_id, timestamp)
     )
     ''')
+    cursor.execute('''
+      CREATE TABLE IF NOT EXISTS global_sentiment (
+        entry_date DATE PRIMARY KEY,
+        fear_greed REAL,
+        vix REAL,
+        fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    ''')
+    # Per-asset: one row per day per symbol
+    cursor.execute('''
+      CREATE TABLE IF NOT EXISTS asset_ta (
+        entry_date DATE,
+        asset TEXT,
+        rsi REAL,
+        macd REAL,
+        macd_signal REAL,
+        macd_histogram REAL,
+        fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (entry_date, asset)
+      )
+    ''')
     
     conn.commit()
     conn.close()
 
+def get_cached_global(d: str):
+    conn = sqlite3.connect(DB)
+    row = conn.execute(
+      "SELECT fear_greed, vix FROM global_sentiment WHERE entry_date = ?", (d,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"fear_greed": row[0], "vix": row[1]}
+
+
+def cache_global(d: str, fg: float, vix: float):
+    conn = sqlite3.connect(DB)
+    conn.execute("""
+      INSERT OR REPLACE INTO global_sentiment(entry_date, fear_greed, vix)
+      VALUES (?, ?, ?)
+    """, (d, fg, vix))
+    conn.commit()
+    conn.close()
+
+
+def get_cached_ta(d: str, asset: str):
+    conn = sqlite3.connect(DB)
+    row = conn.execute("""
+      SELECT rsi, macd, macd_signal, macd_histogram
+      FROM asset_ta WHERE entry_date = ? AND asset = ?
+    """, (d, asset)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+      "rsi": row[0],
+      "macd": row[1],
+      "macd_signal": row[2],
+      "macd_histogram": row[3]
+    }
+
+
+def cache_ta(d: str, asset: str, ta: dict):
+    conn = sqlite3.connect(DB)
+    conn.execute("""
+      INSERT OR REPLACE INTO asset_ta
+      (entry_date, asset, rsi, macd, macd_signal, macd_histogram)
+      VALUES (?, ?, ?, ?, ?, ?)
+    """, (d, asset, ta["rsi"], ta["macd"], ta["macd_signal"], ta["macd_histogram"]))
+    conn.commit()
+    conn.close()
+
+
+def fetch_fear_and_greed() -> float:
+    # returns 0–100
+    idx = FearAndGreedIndex()
+    return idx.get_current_value()
+
+def fetch_vix() -> float:
+    # Download the CSV from datasets/finance-vix repo
+    url = "https://raw.githubusercontent.com/datasets/finance-vix/master/data/vix-daily.csv"
+    resp = requests.get(url)
+    if resp.status_code != 200:
+        raise RuntimeError("Failed to download VIX CSV")
+    # parse CSV and pull today's date
+    reader = csv.DictReader(StringIO(resp.text))
+    today = date.today().isoformat()
+    last_value = None
+    for row in reader:
+        last_value = float(row["CLOSE"])
+    if last_value is not None:
+        return last_value
+    raise RuntimeError("No VIX data found")
+
+
+def fetch_rsi_macd(asset: str) -> dict:
+    handler = TA_Handler(
+        symbol=f"{asset}USD",
+        screener="crypto",
+        exchange="BINANCE",
+        interval=Interval.INTERVAL_1_DAY
+    )
+    ta = handler.get_analysis().indicators
+    return {
+      "rsi": ta.get("RSI", 0),
+      "macd": ta.get("MACD.macd", 0),
+      "macd_signal": ta.get("MACD.signal", 0),
+      "macd_histogram": ta.get("MACD.histogram", 0)
+    }
+
 def get_or_create_symbol(symbol: str) -> int:
     """Get symbol ID or create new symbol if it doesn't exist"""
-    conn = sqlite3.connect('crypto_prices.db')
+    conn = sqlite3.connect(DB)
     cursor = conn.cursor()
     
     try:
@@ -117,7 +230,7 @@ def get_or_create_symbol(symbol: str) -> int:
 
 def insert_price_data(symbol: str, price: float, timestamp: datetime, interval: str, volume: float = None):
     """Insert price data into specified interval table"""
-    conn = sqlite3.connect('crypto_prices.db')
+    conn = sqlite3.connect(DB)
     cursor = conn.cursor()
     
     try:
@@ -150,7 +263,7 @@ def insert_price_data(symbol: str, price: float, timestamp: datetime, interval: 
 
 def get_price_history(symbol: str, interval: str, limit: int = None):
     """Get price history from specified interval table"""
-    conn = sqlite3.connect('crypto_prices.db')
+    conn = sqlite3.connect(DB)
     cursor = conn.cursor()
     
     try:
@@ -201,7 +314,7 @@ def get_price_history(symbol: str, interval: str, limit: int = None):
 
 def cleanup_old_data():
     """Clean up old data from the tables"""
-    conn = sqlite3.connect('crypto_prices.db')
+    conn = sqlite3.connect(DB)
     cursor = conn.cursor()
     
     now = datetime.now()
@@ -497,7 +610,7 @@ def update_database_from_binance(symbol: str, interval: str):
 
 def clean_old_data(interval: str):
     """Clean up old data based on the interval"""
-    conn = sqlite3.connect('crypto_prices.db')
+    conn = sqlite3.connect(DB)
     cursor = conn.cursor()
     
     current_time = datetime.now()
@@ -585,38 +698,60 @@ async def price_data(
         
         # If we need to fetch from API, update the database
         if should_fetch_from_api:
-            try:
-                # Set appropriate time range based on interval
-                end_time = current_time
+    # 1) figure out the one timestamp we already have, if any
+            latest_ts = None
+            if history:
+                latest_ts = datetime.strptime(history[0][0], '%Y-%m-%d %H:%M:%S')
+
+            # 2) delete that one bar so we can refresh it
+            if latest_ts:
+                conn = sqlite3.connect(DB)
+                cur  = conn.cursor()
+                cur.execute(
+                    f"DELETE FROM crypto_history_{interval} "
+                    "WHERE symbol_id = (SELECT id FROM symbols WHERE symbol = ?) "
+                    "  AND timestamp = ?",
+                    (asset, latest_ts.strftime('%Y-%m-%d %H:%M:%S'))
+                )
+                conn.commit()
+                conn.close()
+
+            # 3) set start_time = latest_ts (or fallback to your normal window)
+            if latest_ts:
+                start_time = latest_ts
+            else:
                 if interval == "5min":
-                    start_time = end_time - timedelta(days=1)
+                    start_time = current_time - timedelta(days=1)
                 elif interval == "15min":
-                    start_time = end_time - timedelta(days=7)
+                    start_time = current_time - timedelta(days=7)
                 elif interval == "1h":
-                    start_time = end_time - timedelta(days=30)
-                else:  # 1d - get all historical data
+                    start_time = current_time - timedelta(days=30)
+                else:  # 1d
                     start_time = datetime(2013, 1, 1)
-                
-                # Download and store data
-                data = download_binance_data(asset, interval, start_time=start_time, end_time=end_time)
-                if data:
-                    print(f"Downloaded {len(data)} records for {asset} at {interval} interval")
-                    for timestamp, price, volume in data:
-                        insert_price_data(asset, price, timestamp, interval, volume)
-                    
-                    # Clean up old data again after inserting new data
-                    clean_old_data(interval)
-                    
-                    # Get updated history from database
-                    history = get_price_history(asset, interval, limit)
-                else:
-                    print(f"No new data downloaded for {asset}")
-                    if not history:  # If we have no data at all, raise an error
-                        raise HTTPException(status_code=500, detail="No data available")
+
+            # 4) fetch only from that point forward
+            try:
+                new_data = download_binance_data(asset, interval,
+                                                start_time=start_time,
+                                                end_time=current_time)
+                # 5) insert only truly new bars (those > latest_ts)
+                count = 0
+                for ts, price, vol in new_data:
+                    if latest_ts and ts <= latest_ts:
+                        continue
+                    insert_price_data(asset, price, ts, interval, vol)
+                    count += 1
+                print(f"Inserted {count} new records for {asset} @ {interval}")
+
+                # clean up anything older than your retention policy
+                clean_old_data(interval)
+
+                # finally re-load our history slice
+                history = get_price_history(asset, interval, limit)
             except Exception as e:
-                print(f"Error fetching from Binance: {e}")
-                if not history:  # If we have no data at all, raise an error
-                    raise HTTPException(status_code=500, detail=f"Error fetching price data: {str(e)}")
+                print(f"Error fetching incremental data: {e}")
+                if not history:
+                    raise HTTPException(500, f"Failed to fetch any data: {e}")
         
         # Format response data
         dates = [entry[0] for entry in history]
@@ -746,71 +881,108 @@ async def chart(
     return StreamingResponse(buf, media_type="image/png")
 
 def download_all_data():
-    """Download data for all symbols and intervals, but only if data is missing or old"""
+    """Download data for all symbols and intervals, but only if data is missing or old. Only new records are downloaded and inserted."""
     symbols = ["BTC", "ETH", "SOL"]
     intervals = ["5min", "15min", "1h", "1d"]
-    
+    interval_deltas = {
+        "5min": timedelta(minutes=5),
+        "15min": timedelta(minutes=15),
+        "1h": timedelta(hours=1),
+        "1d": timedelta(days=1),
+    }
     for symbol in symbols:
         for interval in intervals:
             print(f"\nProcessing {interval} data for {symbol}...")
-            
-            # First, clean up old data for this interval
             clean_old_data(interval)
-            
             try:
-                # Get the latest timestamp from database
                 history = get_price_history(symbol, interval, limit=1)
                 current_time = datetime.now()
                 should_download = False
-                
+                latest_timestamp = None
                 if not history:
                     print(f"No data found for {symbol} at {interval} interval, downloading...")
                     should_download = True
                 else:
                     try:
                         latest_timestamp = datetime.strptime(history[0][0], '%Y-%m-%d %H:%M:%S')
-                        # Check if data is too old based on interval
-                        if interval == "5min" and (current_time - latest_timestamp).total_seconds() > 300:  # 5 minutes
+                        print(f"Latest timestamp in DB for {symbol} {interval}: {latest_timestamp}")
+                        if interval == "5min" and (current_time - latest_timestamp).total_seconds() > 300:
                             should_download = True
-                        elif interval == "15min" and (current_time - latest_timestamp).total_seconds() > 900:  # 15 minutes
+                        elif interval == "15min" and (current_time - latest_timestamp).total_seconds() > 900:
                             should_download = True
-                        elif interval == "1h" and (current_time - latest_timestamp).total_seconds() > 3600:  # 1 hour
+                        elif interval == "1h" and (current_time - latest_timestamp).total_seconds() > 3600:
                             should_download = True
-                        elif interval == "1d" and (current_time - latest_timestamp).total_seconds() > 86400:  # 1 day
+                        elif interval == "1d" and (current_time - latest_timestamp).total_seconds() > 86400:
                             should_download = True
                     except (ValueError, IndexError) as e:
                         print(f"Error parsing timestamp: {e}")
                         should_download = True
-                
                 if should_download:
                     print(f"Downloading {interval} data for {symbol}...")
-                    # Set appropriate time range based on interval
                     end_time = current_time
-                    if interval == "5min":
-                        start_time = end_time - timedelta(days=1)
-                    elif interval == "15min":
-                        start_time = end_time - timedelta(days=7)
-                    elif interval == "1h":
-                        start_time = end_time - timedelta(days=30)
-                    else:  # 1d - get all historical data
-                        start_time = datetime(2017, 1, 1)
-                    
-                    # Download and store data
+                    if latest_timestamp:
+                        start_time = latest_timestamp + interval_deltas[interval]
+                        print(f"Setting start_time for Binance download: {start_time}")
+                    else:
+                        if interval == "5min":
+                            start_time = end_time - timedelta(days=1)
+                        elif interval == "15min":
+                            start_time = end_time - timedelta(days=7)
+                        elif interval == "1h":
+                            start_time = end_time - timedelta(days=30)
+                        else:  # 1d - get all historical data
+                            start_time = datetime(2017, 1, 1)
+                        print(f"No latest timestamp, using default start_time: {start_time}")
                     data = download_binance_data(symbol, interval, start_time=start_time, end_time=end_time)
                     if data:
                         print(f"Downloaded {len(data)} records for {symbol} at {interval} interval")
                         for timestamp, price, volume in data:
+                            if latest_timestamp and timestamp <= latest_timestamp:
+                                continue
                             insert_price_data(symbol, price, timestamp, interval, volume)
-                        
-                        # Clean up old data again after inserting new data
                         clean_old_data(interval)
                     else:
                         print(f"No data downloaded for {symbol} at {interval} interval")
                 else:
                     print(f"Data for {symbol} at {interval} interval is up to date")
-                    
             except Exception as e:
                 print(f"Error checking/downloading {interval} data for {symbol}: {e}")
+
+
+
+
+@app.get("/sentiment")
+async def sentiment(asset: str = Query(..., description="e.g. BTC, ETH")):
+    d = date.today().isoformat()
+
+    # 1) Global
+    global_data = get_cached_global(d)
+    if not global_data:
+        try:
+            fg = fetch_fear_and_greed()
+            print(f"Fetched Fear & Greed: {fg}")
+            v = fetch_vix()
+            print(f"Fetched VIX: {v}")
+        except Exception as e:
+            print(f"Global fetch error: {e}")
+            raise HTTPException(502, detail=f"Global fetch error: {e}")
+        cache_global(d, fg, v)
+        global_data = {"fear_greed": fg, "vix": v}
+
+    # 2) Per-asset
+    asset = asset.upper()
+    ta_data = get_cached_ta(d, asset)
+    if not ta_data:
+        try:
+            ta_data = fetch_rsi_macd(asset)
+            print(f"Fetched TA for {asset}: {ta_data}")
+        except Exception as e:
+            print(f"TA fetch error for {asset}: {e}")
+            raise HTTPException(502, detail=f"TA fetch error for {asset}: {e}")
+        cache_ta(d, asset, ta_data)
+
+    # 3) Merge & return
+    return JSONResponse({**global_data, **ta_data})
 
 # Initialize database and check/download data if needed
 init_db()
