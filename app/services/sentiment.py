@@ -3,7 +3,7 @@ from datetime import date
 import requests
 from io import StringIO
 import csv
-from fear_and_greed import *
+import fear_and_greed
 from tradingview_ta import TA_Handler, Interval
 from app.config import DB
 
