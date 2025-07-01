@@ -10,7 +10,7 @@ from app.config import DB
 
 def fetch_fear_and_greed() -> float:
     # returns 0–100
-    idx = FearAndGreedIndex()
+    idx = fear_and_greed.get()
     return idx.get_current_value()
 
 def fetch_vix() -> float:
