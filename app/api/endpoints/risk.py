@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Query, HTTPException
 from fastapi.responses import JSONResponse
 from app.services.risk import compute_risk_metrics
+import sqlite3
 
 router = APIRouter()
 

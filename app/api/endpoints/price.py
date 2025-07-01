@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from app.services.binance import download_binance_data
 from app.database.operations import get_price_history, insert_price_data, clean_old_data
 from app.config import DB
+import sqlite3
 router = APIRouter()
 
 @router.get("/price-data")

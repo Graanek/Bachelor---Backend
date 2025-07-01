@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Query, HTTPException
 from fastapi.responses import JSONResponse
 from datetime import date
+import sqlite3
 from app.services.sentiment import (
     get_cached_global,
     cache_global,

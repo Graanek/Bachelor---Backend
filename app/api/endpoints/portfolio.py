@@ -10,6 +10,7 @@ from app.database.operations import get_price_history, insert_price_data
 from app.services.binance import download_binance_data
 from app.services.portfolio import calculate_efficient_frontier
 from app.config import DEFAULT_ASSETS
+import sqlite3
 
 router = APIRouter()
 

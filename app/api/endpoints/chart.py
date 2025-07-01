@@ -4,6 +4,7 @@ import io
 import matplotlib.pyplot as plt
 import yfinance as yf
 from app.services.utils import map_ticker
+import sqlite3
 
 router = APIRouter()
 
