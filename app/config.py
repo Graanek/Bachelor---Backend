@@ -1,3 +1,3 @@
 # Konfiguracja aplikacji
-DB = "crypto_prices.db"
+DB = "app/crypto_prices.db"
 DEFAULT_ASSETS = ["BTC", "ETH", "SOL"]
