@@ -6,6 +6,7 @@ from app.services.binance import download_all_data
 from contextlib import asynccontextmanager 
 import sqlite3
 from app.config import DB
+import os
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
