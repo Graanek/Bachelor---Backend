@@ -8,3 +8,5 @@ yfinance==0.2.33
 tradingview-ta==3.3.0 
 pytest
 httpx
+fear-and-greed
+requests
